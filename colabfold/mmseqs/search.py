@@ -109,10 +109,13 @@ def mmseqs_search_monomer(
             dbSuffix3 = ".idx"
 
     search_param = ["--num-iterations", "3", "--db-load-mode", str(db_load_mode), "-a", "-e", "0.1", "--max-seqs", "10000"]
+    template_search_param = []
     if gpu:
         search_param += ["--gpu", str(gpu), "--prefilter-mode", "1"] # gpu version only supports ungapped prefilter currently
+        template_search_param += ["--gpu", str(gpu), "--prefilter-mode", "1"]
     else:
         search_param += ["--prefilter-mode", str(prefilter_mode)]
+        template_search_param += ["-s", "7.5", "--prefilter-mode", str(prefilter_mode)]
         if s is not None: # sensitivy can only be set for non-gpu version, gpu version runs at max sensitivity
             search_param += ["-s", "{:.1f}".format(s)]
         else:
@@ -170,7 +173,7 @@ def mmseqs_search_monomer(
 
     if use_templates and not base.joinpath(f"{template_db}.m8").with_suffix('.m8.dbtype').exists():
         run_mmseqs(mmseqs, ["search", base.joinpath("prof_res"), dbbase.joinpath(template_db), base.joinpath("res_pdb"),
-                            base.joinpath("tmp2"), "--db-load-mode", str(db_load_mode), "--threads", str(threads), "-s", "7.5", "-a", "-e", "0.1", "--prefilter-mode", str(prefilter_mode)])
+                            base.joinpath("tmp2"), "--db-load-mode", str(db_load_mode), "--threads", str(threads), "-a", "-e", "0.1"] + template_search_param)
         run_mmseqs(mmseqs, ["convertalis", base.joinpath("prof_res"), dbbase.joinpath(f"{template_db}{dbSuffix3}"), base.joinpath("res_pdb"),
                             base.joinpath(f"{template_db}"), "--format-output",
                             "query,target,fident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits,cigar",
@@ -260,10 +263,12 @@ def mmseqs_search_pair(
         search_param += ["--gpu-server", str(gpu_server)]
     expand_param = ["--expansion-mode", "0", "-e", "inf", "--expand-filter-clusters", "0", "--max-seq-id", "0.95",]
     run_mmseqs(mmseqs, ["search", base.joinpath("qdb"), dbbase.joinpath(db), base.joinpath("res"), base.joinpath("tmp"), "--threads", str(threads),] + search_param,)
+    run_mmseqs(mmseqs, ["mvdb", base.joinpath("tmp/latest/profile_1"), base.joinpath("prof_res")])
+    run_mmseqs(mmseqs, ["lndb", base.joinpath("qdb_h"), base.joinpath("prof_res_h")])    
     run_mmseqs(mmseqs, ["expandaln", base.joinpath("qdb"), dbbase.joinpath(f"{db}{dbSuffix1}"), base.joinpath("res"), dbbase.joinpath(f"{db}{dbSuffix2}"), base.joinpath("res_exp"), "--db-load-mode", str(db_load_mode), "--threads", str(threads),] + expand_param,)
-    run_mmseqs(mmseqs, ["align", base.joinpath("qdb"), dbbase.joinpath(f"{db}{dbSuffix1}"), base.joinpath("res_exp"), base.joinpath("res_exp_realign"), "--db-load-mode", str(db_load_mode), "-e", "0.001", "--max-accept", "1000000", "--threads", str(threads), "-c", "0.5", "--cov-mode", "1",],)
+    run_mmseqs(mmseqs, ["align", base.joinpath("prof_res"), dbbase.joinpath(f"{db}{dbSuffix1}"), base.joinpath("res_exp"), base.joinpath("res_exp_realign"), "--db-load-mode", str(db_load_mode), "-e", "0.001", "--max-accept", "1000000", "--threads", str(threads), "-c", "0.5", "--cov-mode", "1",],)
     run_mmseqs(mmseqs, ["pairaln", base.joinpath("qdb"), dbbase.joinpath(f"{db}"), base.joinpath("res_exp_realign"), base.joinpath("res_exp_realign_pair"), "--db-load-mode", str(db_load_mode), "--pairing-mode", str(pairing_strategy), "--pairing-dummy-mode", "0", "--threads", str(threads), ],)
-    run_mmseqs(mmseqs, ["align", base.joinpath("qdb"), dbbase.joinpath(f"{db}{dbSuffix1}"), base.joinpath("res_exp_realign_pair"), base.joinpath("res_exp_realign_pair_bt"), "--db-load-mode", str(db_load_mode), "-e", "inf", "-a", "--threads", str(threads), ],)
+    run_mmseqs(mmseqs, ["align", base.joinpath("prof_res"), dbbase.joinpath(f"{db}{dbSuffix1}"), base.joinpath("res_exp_realign_pair"), base.joinpath("res_exp_realign_pair_bt"), "--db-load-mode", str(db_load_mode), "-e", "inf", "-a", "--threads", str(threads), ],)
     run_mmseqs(mmseqs, ["pairaln", base.joinpath("qdb"), dbbase.joinpath(f"{db}"), base.joinpath("res_exp_realign_pair_bt"), base.joinpath("res_final"), "--db-load-mode", str(db_load_mode), "--pairing-mode", str(pairing_strategy), "--pairing-dummy-mode", "1", "--threads", str(threads),],)
     run_mmseqs(mmseqs, ["result2msa", base.joinpath("qdb"), dbbase.joinpath(f"{db}{dbSuffix1}"), base.joinpath("res_final"), base.joinpath("pair.a3m"), "--db-load-mode", str(db_load_mode), "--msa-format-mode", "5", "--threads", str(threads),],)
     if unpack:
@@ -275,6 +280,8 @@ def mmseqs_search_pair(
     run_mmseqs(mmseqs, ["rmdb", base.joinpath("res_exp_realign_pair")])
     run_mmseqs(mmseqs, ["rmdb", base.joinpath("res_exp_realign_pair_bt")])
     run_mmseqs(mmseqs, ["rmdb", base.joinpath("res_final")])
+    run_mmseqs(mmseqs, ["rmdb", base.joinpath("prof_res")])
+    run_mmseqs(mmseqs, ["rmdb", base.joinpath("prof_res_h")])
     shutil.rmtree(base.joinpath("tmp"))
     # @formatter:on
     # fmt: on
@@ -441,7 +448,7 @@ def main():
 
     run_mmseqs(
         args.mmseqs,
-        ["createdb", query_file, args.base.joinpath("qdb"), "--shuffle", "0"],
+        ["createdb", query_file, args.base.joinpath("qdb"), "--shuffle", "0", "--dbtype", "1"],
     )
     with args.base.joinpath("qdb.lookup").open("w") as f:
         id = 0
@@ -515,7 +522,7 @@ def main():
                 unpack=args.unpack,
             )
 
-        if args.unpack | args.af3_json:
+        if args.unpack or args.af3_json:
             id = 0
             for job_number, (
                 raw_jobname,

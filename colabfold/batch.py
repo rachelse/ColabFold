@@ -68,7 +68,9 @@ from colabfold.input import (
     pair_msa,
     msa_to_str,
     get_queries,
-    safe_filename
+    safe_filename,
+    modified_mapping,
+    pdb_to_string,
 )
 from colabfold.relax import relax_me
 from colabfold.alphafold import extra_ptm
@@ -78,8 +80,7 @@ from Bio.PDB.PDBIO import Select
 
 # logging settings
 logger = logging.getLogger(__name__)
-import jax
-import jax.numpy as jnp
+from jax import local_devices
 
 # from jax 0.4.6, jax._src.lib.xla_bridge moved to jax._src.xla_bridge
 # suppress warnings: Unable to initialize backend 'rocm' or 'tpu'
@@ -166,23 +167,6 @@ def validate_and_fix_mmcif(cif_file: Path):
         shutil.copy2(cif_file, str(cif_file) + ".bak")
         with open(cif_file, "a") as f:
             f.write(CIF_REVISION_DATE)
-
-modified_mapping = {
-  "MSE" : "MET", "MLY" : "LYS", "FME" : "MET", "HYP" : "PRO",
-  "TPO" : "THR", "CSO" : "CYS", "SEP" : "SER", "M3L" : "LYS",
-  "HSK" : "HIS", "SAC" : "SER", "PCA" : "GLU", "DAL" : "ALA",
-  "CME" : "CYS", "CSD" : "CYS", "OCS" : "CYS", "DPR" : "PRO",
-  "B3K" : "LYS", "ALY" : "LYS", "YCM" : "CYS", "MLZ" : "LYS",
-  "4BF" : "TYR", "KCX" : "LYS", "B3E" : "GLU", "B3D" : "ASP",
-  "HZP" : "PRO", "CSX" : "CYS", "BAL" : "ALA", "HIC" : "HIS",
-  "DBZ" : "ALA", "DCY" : "CYS", "DVA" : "VAL", "NLE" : "LEU",
-  "SMC" : "CYS", "AGM" : "ARG", "B3A" : "ALA", "DAS" : "ASP",
-  "DLY" : "LYS", "DSN" : "SER", "DTH" : "THR", "GL3" : "GLY",
-  "HY3" : "PRO", "LLP" : "LYS", "MGN" : "GLN", "MHS" : "HIS",
-  "TRQ" : "TRP", "B3Y" : "TYR", "PHI" : "PHE", "PTR" : "TYR",
-  "TYS" : "TYR", "IAS" : "ASP", "GPL" : "LYS", "KYN" : "TRP",
-  "CSD" : "CYS", "SEC" : "CYS"
-}
 
 class ReplaceOrRemoveHetatmSelect(Select):
   def accept_residue(self, residue):
@@ -336,6 +320,7 @@ def predict_structure(
     pad_len: int,
     model_type: str,
     model_runner_and_params: List[Tuple[str, model.RunModel, haiku.Params]],
+    initial_guess: str = None,
     num_relax: int = 0,
     relax_max_iterations: int = 0,
     relax_tolerance: float = 2.39,
@@ -394,6 +379,18 @@ def predict_structure(
             tag = f"{model_type}_{model_name}_seed_{seed:03d}"
             model_names.append(tag)
             files.set_tag(tag)
+
+            # initial guess
+            if initial_guess:
+                input_guess = Path(initial_guess)
+                if input_guess.suffix == ".pdb":
+                    pdb_string = pdb_to_string(initial_guess)
+                    input_features["all_atom_positions"] = protein.from_pdb_string(pdb_string).atom_positions
+                elif input_guess.suffix == ".cif":
+                    input_features["all_atom_positions"] = protein.from_mmcif_string(input_guess.read_text()).atom_positions
+                else:
+                    raise ValueError(f"Unsupported initial guess file format: {initial_guess}")
+                
 
             ########################
             # predict
@@ -876,6 +873,37 @@ def generate_input_feature(
             }
     return (input_feature, domain_names)
 
+def normalize_a3m(lines: list[str]) -> list[str]:
+    out = []
+    i = 0
+
+    # keep meta header
+    if lines and lines[0].startswith("#"):
+        out.append(lines[0].rstrip("\n"))
+        i = 1
+
+    header = None
+    seq_chunks = []
+    while i < len(lines):
+        line = lines[i].strip()
+        i += 1
+        if not line:
+            continue
+        if line.startswith(">"):
+            if header is not None:
+                out.append(header)
+                out.append("".join(seq_chunks))
+            header = line
+            seq_chunks = []
+        else:
+            # remove all whitespace inside sequence lines
+            seq_chunks.append("".join(line.split()))
+    if header is not None:
+        out.append(header)
+        out.append("".join(seq_chunks))
+
+    return out
+
 def unserialize_msa(
     a3m_lines: List[str], query_sequence: Union[List[str], str]
 ) -> Tuple[
@@ -886,6 +914,7 @@ def unserialize_msa(
     List[Dict[str, Any]],
 ]:
     a3m_lines = a3m_lines[0].replace("\x00", "").splitlines()
+    a3m_lines = normalize_a3m(a3m_lines)
     if not a3m_lines[0].startswith("#") or len(a3m_lines[0][1:].split("\t")) != 2:
         assert isinstance(query_sequence, str)
         return (
@@ -1039,6 +1068,7 @@ def run(
     num_recycles: Optional[int] = None,
     recycle_early_stop_tolerance: Optional[float] = None,
     model_order: List[int] = [1,2,3,4,5],
+    initial_guess: str = None,
     num_ensemble: int = 1,
     model_type: str = "auto",
     msa_mode: str = "mmseqs2_uniref_env",
@@ -1083,21 +1113,20 @@ def run(
     # check what device is available
     try:
         # check if TPU is available
-        import jax.tools.colab_tpu
-        jax.tools.colab_tpu.setup_tpu()
-        logger.info('Running on TPU')
-        DEVICE = "tpu"
-        use_gpu_relax = False
+        from tpu_info import device
+        if len(device.get_local_chips()) > 0:
+            import jax.tools.colab_tpu
+            jax.tools.colab_tpu.setup_tpu()
+            logger.info('Running on TPU')
+            use_gpu_relax = False
     except:
-        if jax.local_devices()[0].platform == 'cpu':
+        if local_devices()[0].platform == 'cpu':
             logger.info("WARNING: no GPU detected, will be using CPU")
-            DEVICE = "cpu"
             use_gpu_relax = False
         else:
             import tensorflow as tf
             tf.get_logger().setLevel(logging.ERROR)
             logger.info('Running on GPU')
-            DEVICE = "gpu"
             # disable GPU on tensorflow
             tf.config.set_visible_devices([], 'GPU')
 
@@ -1177,6 +1206,10 @@ def run(
     # sort model order
     model_order.sort()
 
+    # initial guess
+    if initial_guess is not None:
+        logger.info(f'Using initial guess: {initial_guess}')
+
     # Record the parameters of this run
     config = {
         "num_queries": len(queries),
@@ -1193,6 +1226,7 @@ def run(
         "recycle_early_stop_tolerance": recycle_early_stop_tolerance,
         "num_ensemble": num_ensemble,
         "model_order": model_order,
+        "initial_guess": initial_guess,
         "keep_existing_results": keep_existing_results,
         "rank_by": rank_by,
         "max_seq": max_seq,
@@ -1402,6 +1436,7 @@ def run(
                     use_templates=use_templates,
                     sequences_lengths=query_sequence_len_array,
                     pad_len=pad_len,
+                    initial_guess=initial_guess,
                     model_type=model_type,
                     model_runner_and_params=model_runner_and_params,
                     num_relax=num_relax,
@@ -1703,6 +1738,14 @@ def main():
     )
     pred_group.add_argument("--model-order", default="1,2,3,4,5", type=str)
     pred_group.add_argument(
+        "--initial-guess",
+        nargs="?",
+        const=True,
+        help="Specify a starting model for the prediction. If the main input file is a PDB format, "
+        "it will be used as the initial guess. Otherwise, you can provide an input file with this flag, "
+        "which will override the main input."
+    )
+    pred_group.add_argument(
         "--use-dropout",
         default=False,
         action="store_true",
@@ -1924,6 +1967,17 @@ def main():
 
     model_type = set_model_type(is_complex, args.model_type)
 
+    # use pdb or cif input as initial guess
+    if args.initial_guess is not None:
+        if isinstance(args.initial_guess, str) and Path(args.initial_guess).suffix in (".pdb", ".cif"):
+            initial_guess = args.initial_guess
+        elif Path(args.input).suffix in (".pdb", ".cif"):
+            initial_guess = args.input
+        else:
+            raise ValueError("Provide PDB or CIF file for initial guess.")
+    else:
+        initial_guess = None
+
     if args.msa_only:
         args.num_models = 0
 
@@ -1981,6 +2035,7 @@ def main():
         recycle_early_stop_tolerance=args.recycle_early_stop_tolerance,
         num_ensemble=args.num_ensemble,
         model_order=model_order,
+        initial_guess=initial_guess,
         is_complex=is_complex,
         keep_existing_results=not args.overwrite_existing_results,
         rank_by=args.rank,
